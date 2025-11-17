@@ -1,0 +1,7 @@
+{
+  "auth_key": "supersecretkey",
+  "client_id": "web-server",
+  "service_address": "localhost:3000",
+  "server_address": "YOUR_VPS_IP",
+  "server_port": "7000"
+}

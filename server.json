@@ -1,0 +1,9 @@
+{
+  "client_listen_port": "7000",
+  "public_listen_ports": {
+    "web-server": {
+      "port": 80,
+      "key": "supersecretkey"
+    }
+  }
+}
