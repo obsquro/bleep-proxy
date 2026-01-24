@@ -5,265 +5,413 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-type PortConfig struct {
-	Port     int    `json:"port"`
-	Key      string `json:"key"`
-	Protocol string `json:"protocol"`
+const (
+	defaultConfigPath = "server.json"
+	readBufferSize    = 32 * 1024
+	udpBufferSize     = 65535
+	handshakeTimeout  = 10 * time.Second
+	keepAlivePeriod   = 30 * time.Second
+	cleanupInterval   = 30 * time.Second
+	sessionTimeout    = 60 * time.Second
+)
+
+type Config struct {
+	ClientListenPort string           `json:"client_listen_port"`
+	StatsPort        string           `json:"stats_port"`
+	Users            []UserConfig     `json:"users"`
+	Listeners        []ListenerConfig `json:"listeners"`
 }
 
-type ServerConfig struct {
-	ClientListenPort  string                `json:"client_listen_port"`
-	PublicListenPorts map[string]PortConfig `json:"public_listen_ports"`
+type UserConfig struct {
+	ID  string `json:"id"`
+	Key string `json:"key"`
+}
+
+type ListenerConfig struct {
+	Protocol     string `json:"protocol"`
+	Port         int    `json:"port"`
+	TargetClient string `json:"target_client"`
+	Priority     int    `json:"priority"`
+}
+
+type Authenticator interface {
+	Authenticate(id, key string) bool
+}
+
+type InMemoryAuthenticator struct {
+	users map[string]string
+}
+
+func NewInMemoryAuthenticator(users []UserConfig) *InMemoryAuthenticator {
+	m := make(map[string]string)
+	for _, u := range users {
+		m[u.ID] = u.Key
+	}
+	return &InMemoryAuthenticator{users: m}
+}
+
+func (a *InMemoryAuthenticator) Authenticate(id, key string) bool {
+	storedKey, ok := a.users[id]
+	return ok && storedKey == key
+}
+
+
+type TunnelRegistry interface {
+	Register(id string, tunnel *Multiplexer)
+	Unregister(id string)
+	Get(id string) *Multiplexer
+	Range(f func(id string, tunnel *Multiplexer) bool)
+}
+
+type InMemoryRegistry struct {
+	tunnels map[string]*Multiplexer
+	mu      sync.RWMutex
+}
+
+func (r *InMemoryRegistry) Range(f func(id string, tunnel *Multiplexer) bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for id, t := range r.tunnels {
+		if !f(id, t) {
+			break
+		}
+	}
+}
+
+func NewInMemoryRegistry() *InMemoryRegistry {
+	return &InMemoryRegistry{
+		tunnels: make(map[string]*Multiplexer),
+	}
+}
+
+func (r *InMemoryRegistry) Register(id string, tunnel *Multiplexer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if old, ok := r.tunnels[id]; ok {
+		old.Close()
+	}
+	r.tunnels[id] = tunnel
+}
+
+func (r *InMemoryRegistry) Unregister(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.tunnels, id)
+}
+
+func (r *InMemoryRegistry) Get(id string) *Multiplexer {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.tunnels[id]
+}
+
+type Listener interface {
+	Start(ctx context.Context)
 }
 
 type Server struct {
-	config         ServerConfig
-	clients        map[string]*Multiplexer
-	clientsMutex   sync.RWMutex
-	wg             sync.WaitGroup
-	stop           chan struct{}
-	listeners      []net.Listener
-	listenersMutex sync.Mutex
+	config   *Config
+	auth     Authenticator
+	registry TunnelRegistry
+	wg       sync.WaitGroup
 }
 
 func main() {
-	configPath := flag.String("config", "server.json", "Path to config file")
+	configPath := flag.String("config", defaultConfigPath, "Path to config file")
 	flag.Parse()
 
-	data, err := os.ReadFile(*configPath)
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to read config: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	var config ServerConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		log.Fatalf("Failed to parse config: %v", err)
+	server := NewServer(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		log.Println("Shutting down...")
+		cancel()
+	}()
+
+	if err := server.Run(ctx); err != nil {
+		log.Fatalf("Server error: %v", err)
 	}
 
-	server := &Server{
-		config:  config,
-		clients: make(map[string]*Multiplexer),
-		stop:    make(chan struct{}),
-	}
-
-	log.Printf("Starting Bleep Proxy Server")
-	log.Printf("Client port: %s", config.ClientListenPort)
-	log.Printf("Public ports: %d", len(config.PublicListenPorts))
-
-	server.wg.Add(1)
-	go server.listenForClients()
-
-	for clientID, portCfg := range config.PublicListenPorts {
-		server.wg.Add(1)
-		go server.listenForPublic(clientID, portCfg)
-	}
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	log.Println("Shutting down...")
-	close(server.stop)
-	server.closeAllListeners()
-	server.closeAllClients()
-	server.wg.Wait()
 	log.Println("Shutdown complete")
 }
 
-func (s *Server) closeAllListeners() {
-	s.listenersMutex.Lock()
-	defer s.listenersMutex.Unlock()
-
-	for _, listener := range s.listeners {
-		listener.Close()
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
-	log.Printf("Closed %d listeners", len(s.listeners))
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
 
-func (s *Server) closeAllClients() {
-	s.clientsMutex.Lock()
-	defer s.clientsMutex.Unlock()
-
-	for clientID, mux := range s.clients {
-		mux.Close()
-		log.Printf("Closed client %s", clientID)
+func NewServer(cfg *Config) *Server {
+	return &Server{
+		config:   cfg,
+		auth:     NewInMemoryAuthenticator(cfg.Users),
+		registry: NewInMemoryRegistry(),
 	}
 }
 
-func (s *Server) listenForClients() {
+func (s *Server) Run(ctx context.Context) error {
+	log.Printf("Starting Bleep Proxy Server")
+	
+	s.wg.Add(1)
+	go s.runStatsServer(ctx)
+
+	s.wg.Add(1)
+	go s.runClientListener(ctx)
+
+	for _, lCfg := range s.config.Listeners {
+		l, err := NewListenerFactory(lCfg, s.registry)
+		if err != nil {
+			log.Printf("Failed to create listener for %s:%d: %v", lCfg.Protocol, lCfg.Port, err)
+			continue
+		}
+		s.wg.Add(1)
+		go func(l Listener) {
+			defer s.wg.Done()
+			l.Start(ctx)
+		}(l)
+	}
+
+	<-ctx.Done()
+	s.wg.Wait()
+	return nil
+}
+
+func (s *Server) runStatsServer(ctx context.Context) {
 	defer s.wg.Done()
 
-	listener, err := net.Listen("tcp", ":"+s.config.ClientListenPort)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/statistics", func(w http.ResponseWriter, r *http.Request) {
+		stats := make(map[string]interface{})
+		tunnels := make([]map[string]interface{}, 0)
+
+		s.registry.Range(func(id string, t *Multiplexer) bool {
+			tunnelStats := map[string]interface{}{
+				"client_id":      id,
+				"bytes_sent":     atomic.LoadUint64(&t.BytesSent),
+				"bytes_received": atomic.LoadUint64(&t.BytesReceived),
+
+			}
+			tunnels = append(tunnels, tunnelStats)
+			return true
+		})
+
+		stats["tunnels_count"] = len(tunnels)
+		stats["tunnels"] = tunnels
+		stats["listeners"] = s.config.Listeners
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stats)
+	})
+
+	port := s.config.StatsPort
+	if port == "" {
+		port = "8080" 
+	}
+	server := &http.Server{Addr: ":" + port, Handler: mux}
+	
+	log.Printf("Starting Stats Server on :%s", port)
+
+	go func() {
+		<-ctx.Done()
+		server.Shutdown(context.Background())
+	}()
+
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		log.Printf("Stats server error: %v", err)
+	}
+}
+
+func (s *Server) runClientListener(ctx context.Context) {
+	defer s.wg.Done()
+	
+	addr := ":" + s.config.ClientListenPort
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("Failed to listen for clients: %v", err)
+		log.Printf("Failed to listen for clients on %s: %v", addr, err)
+		return
 	}
 	defer listener.Close()
 
-	s.listenersMutex.Lock()
-	s.listeners = append(s.listeners, listener)
-	s.listenersMutex.Unlock()
+	log.Printf("Listening for clients on %s", addr)
 
-	log.Printf("Listening for clients on :%s", s.config.ClientListenPort)
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			select {
-			case <-s.stop:
+			case <-ctx.Done():
 				return
 			default:
 				log.Printf("Accept client error: %v", err)
 				continue
 			}
 		}
-
-		go s.handleClient(conn)
+		go s.handleClientConnection(conn)
 	}
 }
 
-func (s *Server) handleClient(conn net.Conn) {
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	reader := bufio.NewReader(conn)
-	authLine, err := reader.ReadString('\n')
-	conn.SetReadDeadline(time.Time{})
-
+func (s *Server) handleClientConnection(conn net.Conn) {
+	id, key, err := s.handshake(conn)
 	if err != nil {
-		log.Printf("Failed to read auth: %v", err)
+		log.Printf("Handshake failed: %v", err)
 		conn.Close()
 		return
 	}
 
-	authLine = strings.TrimSpace(authLine)
-	parts := strings.SplitN(authLine, ":", 2)
-	if len(parts) != 2 {
-		log.Printf("Invalid auth format")
-		conn.Close()
-		return
-	}
-
-	clientID := parts[0]
-	authKey := parts[1]
-
-	s.clientsMutex.RLock()
-	portCfg, exists := s.config.PublicListenPorts[clientID]
-	s.clientsMutex.RUnlock()
-
-	if !exists || portCfg.Key != authKey {
-		log.Printf("Auth failed for client %s", clientID)
+	if !s.auth.Authenticate(id, key) {
+		log.Printf("Authentication failed for %s", id)
 		conn.Write([]byte{0})
 		conn.Close()
 		return
 	}
 
-	log.Printf("Client %s authenticated", clientID)
 
-	mux := NewMultiplexer(conn)
-
-	s.clientsMutex.Lock()
-	if oldMux, exists := s.clients[clientID]; exists {
-		oldMux.Close()
+	if _, err := conn.Write([]byte{1}); err != nil {
+		log.Printf("Failed to send auth success: %v", err)
+		conn.Close()
+		return
 	}
-	s.clients[clientID] = mux
-	s.clientsMutex.Unlock()
+
+	log.Printf("Client connected: %s", id)
+	mux := NewMultiplexer(conn)
+	s.registry.Register(id, mux)
 
 	mux.ReadLoop(func(frame *Frame) {
-		s.handleClientFrame(clientID, frame)
+		log.Printf("Unexpected frame from client %s: %v", id, frame.Type)
 	})
 
-	s.clientsMutex.Lock()
-	delete(s.clients, clientID)
-	s.clientsMutex.Unlock()
-
-	log.Printf("Client %s disconnected", clientID)
+	s.registry.Unregister(id)
+	log.Printf("Client disconnected: %s", id)
 }
 
-func (s *Server) handleClientFrame(clientID string, frame *Frame) {
-
-	s.clientsMutex.RLock()
-	mux := s.clients[clientID]
-	s.clientsMutex.RUnlock()
-
-	if mux == nil {
-		return
+func (s *Server) handshake(conn net.Conn) (string, string, error) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(keepAlivePeriod)
 	}
 
-	mux.SafeSend(frame.ChannelID, frame)
-}
+	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	defer conn.SetReadDeadline(time.Time{})
 
-func (s *Server) listenForPublic(clientID string, portCfg PortConfig) {
-	if portCfg.Protocol == "udp" {
-		s.listenForPublicUDP(clientID, portCfg)
-		return
-	}
-
-	defer s.wg.Done()
-
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", portCfg.Port))
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
 	if err != nil {
-		log.Fatalf("Failed to listen on port %d: %v", portCfg.Port, err)
+		return "", "", err
+	}
+
+	parts := strings.SplitN(strings.TrimSpace(line), ":", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid format")
+	}
+
+	return parts[0], parts[1], nil
+}
+
+func NewListenerFactory(cfg ListenerConfig, registry TunnelRegistry) (Listener, error) {
+	switch cfg.Protocol {
+	case "tcp":
+		return &TCPListener{
+			port:     cfg.Port,
+			target:   cfg.TargetClient,
+			priority: cfg.Priority,
+			registry: registry,
+		}, nil
+	case "udp":
+		return &UDPListener{
+			port:     cfg.Port,
+			target:   cfg.TargetClient,
+			priority: cfg.Priority,
+			registry: registry,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported protocol: %s", cfg.Protocol)
+	}
+}
+
+type TCPListener struct {
+	port     int
+	target   string
+	priority int
+	registry TunnelRegistry
+}
+
+func (l *TCPListener) Start(ctx context.Context) {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", l.port))
+	if err != nil {
+		log.Printf("TCP Listener error on %d: %v", l.port, err)
+		return
 	}
 	defer listener.Close()
 
-	s.listenersMutex.Lock()
-	s.listeners = append(s.listeners, listener)
-	s.listenersMutex.Unlock()
+	log.Printf("Started TCP Listener on :%d -> %s", l.port, l.target)
 
-	log.Printf("Listening for public on :%d (client: %s)", portCfg.Port, clientID)
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			select {
-			case <-s.stop:
+			case <-ctx.Done():
 				return
 			default:
-				log.Printf("Accept public error: %v", err)
+				log.Printf("Accept error on :%d: %v", l.port, err)
 				continue
 			}
 		}
-
-		go s.handlePublic(conn, clientID)
+		go l.handleConn(conn)
 	}
 }
 
-func (s *Server) handlePublic(publicConn net.Conn, clientID string) {
-	defer publicConn.Close()
+func (l *TCPListener) handleConn(conn net.Conn) {
+	defer conn.Close()
 
-	s.clientsMutex.RLock()
-	mux, exists := s.clients[clientID]
-	s.clientsMutex.RUnlock()
-
-	if !exists || mux == nil {
-		log.Printf("No client connected for %s", clientID)
+	tunnel := l.registry.Get(l.target)
+	if tunnel == nil {
 		return
 	}
 
-	channelID, dataChan := mux.OpenChannel()
+	chID, stream := tunnel.OpenChannel(l.priority)
 
-	if err := mux.WriteFrame(&Frame{
-		Type:      FrameTypeOpen,
-		ChannelID: channelID,
-		Data:      []byte{ProtocolTCP},
-	}); err != nil {
-		mux.CloseChannel(channelID)
+	payload := []byte{byte(ProtocolTCP), byte(l.priority)}
+	if err := tunnel.WriteFrame(&Frame{Type: FrameTypeOpen, ChannelID: chID, Data: payload}); err != nil {
+		tunnel.CloseChannel(chID)
 		return
 	}
 
@@ -272,168 +420,196 @@ func (s *Server) handlePublic(publicConn net.Conn, clientID string) {
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32768)
-		for {
-			n, err := publicConn.Read(buf)
-			if n > 0 {
-				if err := mux.WriteFrame(&Frame{
-					Type:      FrameTypeData,
-					ChannelID: channelID,
-					Data:      buf[:n],
-				}); err != nil {
-					return
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-		mux.WriteFrame(&Frame{
-			Type:      FrameTypeClose,
-			ChannelID: channelID,
-		})
+		l.pipeSocketToTunnel(conn, tunnel, chID)
 	}()
 
 	go func() {
 		defer wg.Done()
-		for frame := range dataChan {
-			if frame.Type == FrameTypeData && len(frame.Data) > 0 {
-				publicConn.Write(frame.Data)
-			} else if frame.Type == FrameTypeClose {
-				break
-			}
-		}
+		l.pipeTunnelToSocket(stream, conn)
 	}()
 
 	wg.Wait()
-	mux.CloseChannel(channelID)
+	tunnel.CloseChannel(chID)
 }
 
-func (s *Server) listenForPublicUDP(clientID string, portCfg PortConfig) {
-	defer s.wg.Done()
-
-	addr := fmt.Sprintf(":%d", portCfg.Port)
-	pconn, err := net.ListenPacket("udp", addr)
-	if err != nil {
-		log.Fatalf("Failed to listen UDP on %s: %v", addr, err)
-	}
-
-	log.Printf("Listening for public UDP on %s (client: %s)", addr, clientID)
-
-	go func() {
-		<-s.stop
-		pconn.Close()
-	}()
-
-	type udpSession struct {
-		channelID  uint32
-		lastActive time.Time
-	}
-
-	sessions := make(map[string]*udpSession)
-	var sessMu sync.Mutex
-
-	// Cleanup routine for inactive sessions
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.stop:
+func (l *TCPListener) pipeSocketToTunnel(conn net.Conn, tunnel *Multiplexer, chID uint32) {
+	buf := make([]byte, readBufferSize)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			if err := tunnel.WriteFrame(&Frame{Type: FrameTypeData, ChannelID: chID, Data: data}); err != nil {
 				return
-			case <-ticker.C:
-				sessMu.Lock()
-				now := time.Now()
-				for key, sess := range sessions {
-					if now.Sub(sess.lastActive) > 60*time.Second {
-						s.clientsMutex.RLock()
-						mux := s.clients[clientID]
-						s.clientsMutex.RUnlock()
-						if mux != nil {
-							mux.CloseChannel(sess.channelID)
-							mux.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: sess.channelID})
-						}
-						delete(sessions, key)
-					}
-				}
-				sessMu.Unlock()
 			}
 		}
+		if err != nil {
+			tunnel.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: chID})
+			return
+		}
+	}
+}
+
+func (l *TCPListener) pipeTunnelToSocket(stream chan *Frame, conn net.Conn) {
+	for frame := range stream {
+		if frame.Type != FrameTypeData {
+			return
+		}
+		if _, err := conn.Write(frame.Data); err != nil {
+			return
+		}
+	}
+}
+
+type UDPListener struct {
+	port     int
+	target   string
+	priority int
+	registry TunnelRegistry
+}
+
+func (l *UDPListener) Start(ctx context.Context) {
+	conn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", l.port))
+	if err != nil {
+		log.Printf("UDP Listener error on %d: %v", l.port, err)
+		return
+	}
+	defer conn.Close()
+
+	log.Printf("Started UDP Listener on :%d -> %s", l.port, l.target)
+
+	go func() {
+		<-ctx.Done()
+		conn.Close()
 	}()
 
-	buf := make([]byte, 65535)
+	sessions := NewUDPSessionManager(l.registry, l.target, l.priority, conn)
+	go sessions.CleanupLoop(ctx)
+
+	buf := make([]byte, udpBufferSize)
 	for {
-		n, remoteAddr, err := pconn.ReadFrom(buf)
+		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
 			select {
-			case <-s.stop:
+			case <-ctx.Done():
 				return
 			default:
-				log.Printf("Read UDP error: %v", err)
+				log.Printf("Read error on :%d: %v", l.port, err)
 				continue
 			}
 		}
-
-		remoteKey := remoteAddr.String()
-
-		s.clientsMutex.RLock()
-		mux := s.clients[clientID]
-		s.clientsMutex.RUnlock()
-
-		if mux == nil {
-			continue
-		}
-
-		sessMu.Lock()
-		sess, exists := sessions[remoteKey]
-		if exists {
-			sess.lastActive = time.Now()
-		}
-		sessMu.Unlock()
-
-		if !exists {
-			channelID, dataChan := mux.OpenChannel()
-
-			if err := mux.WriteFrame(&Frame{
-				Type:      FrameTypeOpen,
-				ChannelID: channelID,
-				Data:      []byte{ProtocolUDP},
-			}); err != nil {
-				mux.CloseChannel(channelID)
-				continue
-			}
-
-			sess = &udpSession{
-				channelID:  channelID,
-				lastActive: time.Now(),
-			}
-
-			sessMu.Lock()
-			sessions[remoteKey] = sess
-			sessMu.Unlock()
-
-			// Handle return traffic from client -> udp public
-			go func(chID uint32, dChan chan *Frame, rAddr net.Addr) {
-				for frame := range dChan {
-					if frame.Type == FrameTypeData && len(frame.Data) > 0 {
-						pconn.WriteTo(frame.Data, rAddr)
-					} else if frame.Type == FrameTypeClose {
-						break
-					}
-				}
-				sessMu.Lock()
-				if s, ok := sessions[remoteKey]; ok && s.channelID == chID {
-					delete(sessions, remoteKey)
-				}
-				sessMu.Unlock()
-				mux.CloseChannel(chID)
-			}(channelID, dataChan, remoteAddr)
-		}
-
-		mux.WriteFrame(&Frame{
-			Type:      FrameTypeData,
-			ChannelID: sess.channelID,
-			Data:      buf[:n],
-		})
+		
+		data := make([]byte, n)
+		copy(data, buf[:n])
+		sessions.HandlePacket(addr, data)
 	}
+}
+
+type UDPSessionManager struct {
+	registry     TunnelRegistry
+	target       string
+	priority     int
+	conn         net.PacketConn
+	sessions     map[string]*UDPSession
+	mu           sync.Mutex
+}
+
+type UDPSession struct {
+	chID       uint32
+	lastActive time.Time
+}
+
+func NewUDPSessionManager(reg TunnelRegistry, target string, priority int, conn net.PacketConn) *UDPSessionManager {
+	return &UDPSessionManager{
+		registry: reg,
+		target:   target,
+		priority: priority,
+		conn:     conn,
+		sessions: make(map[string]*UDPSession),
+	}
+}
+
+func (m *UDPSessionManager) CleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.prune()
+		}
+	}
+}
+
+func (m *UDPSessionManager) prune() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for key, s := range m.sessions {
+		if now.Sub(s.lastActive) > sessionTimeout {
+			if t := m.registry.Get(m.target); t != nil {
+				t.CloseChannel(s.chID)
+				t.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: s.chID})
+			}
+			delete(m.sessions, key)
+		}
+	}
+}
+
+func (m *UDPSessionManager) HandlePacket(addr net.Addr, data []byte) {
+	tunnel := m.registry.Get(m.target)
+	if tunnel == nil {
+		return
+	}
+
+	key := addr.String()
+	m.mu.Lock()
+	sess, exists := m.sessions[key]
+	if exists {
+		sess.lastActive = time.Now()
+	}
+	m.mu.Unlock()
+
+	if !exists {
+		sess = m.createSession(key, addr, tunnel)
+		if sess == nil {
+			return
+		}
+	}
+
+	tunnel.WriteFrame(&Frame{Type: FrameTypeData, ChannelID: sess.chID, Data: data})
+}
+
+func (m *UDPSessionManager) createSession(key string, addr net.Addr, tunnel *Multiplexer) *UDPSession {
+	chID, stream := tunnel.OpenChannel(m.priority)
+
+	payload := []byte{byte(ProtocolUDP), byte(m.priority)}
+	if err := tunnel.WriteFrame(&Frame{Type: FrameTypeOpen, ChannelID: chID, Data: payload}); err != nil {
+		tunnel.CloseChannel(chID)
+		return nil
+	}
+
+	sess := &UDPSession{chID: chID, lastActive: time.Now()}
+	m.mu.Lock()
+	m.sessions[key] = sess
+	m.mu.Unlock()
+
+	go func() {
+		for frame := range stream {
+			if frame.Type == FrameTypeData {
+				m.conn.WriteTo(frame.Data, addr)
+			} else {
+				break
+			}
+		}
+		m.mu.Lock()
+		if s, ok := m.sessions[key]; ok && s.chID == chID {
+			delete(m.sessions, key)
+		}
+		m.mu.Unlock()
+		tunnel.CloseChannel(chID)
+	}()
+
+	return sess
 }

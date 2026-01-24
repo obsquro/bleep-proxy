@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,7 +17,18 @@ import (
 	"time"
 )
 
-type ClientConfig struct {
+const (
+	defaultConfigPath  = "client.json"
+	readBufferSize     = 65535
+	dialTimeout        = 10 * time.Second
+	localDialTimeout   = 5 * time.Second
+	keepAlivePeriod    = 30 * time.Second
+	retryInterval      = 5 * time.Second
+	shutdownTimeout    = 3 * time.Second
+	connectionTimeout  = 60 * time.Second 
+)
+
+type Config struct {
 	AuthKey        string `json:"auth_key"`
 	ClientID       string `json:"client_id"`
 	ServiceAddress string `json:"service_address"`
@@ -24,215 +36,236 @@ type ClientConfig struct {
 	ServerPort     string `json:"server_port"`
 }
 
-type Client struct {
-	config      ClientConfig
-	mux         *Multiplexer
-	mu          sync.Mutex
-	stop        chan struct{}
-	activeConns sync.WaitGroup
+type UpstreamConnector interface {
+	Connect(ctx context.Context) (*Multiplexer, error)
 }
 
-func main() {
-	configPath := flag.String("config", "client.json", "Path to config file")
-	flag.Parse()
+type BleepConnector struct {
+	config *Config
+}
 
-	data, err := os.ReadFile(*configPath)
+func (c *BleepConnector) Connect(ctx context.Context) (*Multiplexer, error) {
+	addr := fmt.Sprintf("%s:%s", c.config.ServerAddress, c.config.ServerPort)
+	dialer := net.Dialer{Timeout: dialTimeout}
+	
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		log.Fatalf("Failed to read config: %v", err)
-	}
-
-	var config ClientConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		log.Fatalf("Failed to parse config: %v", err)
-	}
-
-	client := &Client{
-		config: config,
-		stop:   make(chan struct{}),
-	}
-
-	log.Printf("Starting Bleep Proxy Client")
-	log.Printf("Server: %s:%s", config.ServerAddress, config.ServerPort)
-	log.Printf("Local Service: %s", config.ServiceAddress)
-
-	go client.run()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	log.Println("Shutting down...")
-	close(client.stop)
-
-	client.mu.Lock()
-	if client.mux != nil {
-		client.mux.Close()
-	}
-	client.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		client.activeConns.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Println("Shutdown complete")
-	case <-time.After(3 * time.Second):
-		log.Println("Shutdown timeout - forcing exit")
-	}
-}
-
-func (c *Client) run() {
-	for {
-		select {
-		case <-c.stop:
-			return
-		default:
-		}
-
-		if err := c.connect(); err != nil {
-			select {
-			case <-c.stop:
-
-				return
-			default:
-				log.Printf("Connection error: %v", err)
-			}
-		}
-
-		select {
-		case <-c.stop:
-			return
-		case <-time.After(5 * time.Second):
-		}
-	}
-}
-
-func (c *Client) connect() error {
-	serverAddr := fmt.Sprintf("%s:%s", c.config.ServerAddress, c.config.ServerPort)
-	conn, err := net.DialTimeout("tcp", serverAddr, 10*time.Second)
-	if err != nil {
-		return fmt.Errorf("dial server: %w", err)
+		return nil, err
 	}
 
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetKeepAlivePeriod(keepAlivePeriod)
 	}
 
-	authData := fmt.Sprintf("%s:%s\n", c.config.ClientID, c.config.AuthKey)
-	if _, err := conn.Write([]byte(authData)); err != nil {
+	if err := c.authenticate(conn); err != nil {
 		conn.Close()
-		return fmt.Errorf("send auth: %w", err)
+		return nil, err
 	}
 
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	response := make([]byte, 1)
-	n, err := conn.Read(response)
-	if err == nil && n > 0 && response[0] == 0 {
-		conn.Close()
-		log.Fatalf("Authentication failed: invalid auth_key or client_id")
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	log.Printf("Connected to server")
-
-	c.mu.Lock()
-	c.mux = NewMultiplexer(conn)
-	c.mu.Unlock()
-
-	c.mux.ReadLoop(c.handleFrame)
-
-	return fmt.Errorf("connection closed")
+	return NewMultiplexer(conn), nil
 }
 
-func (c *Client) handleFrame(frame *Frame) {
-	switch frame.Type {
-	case FrameTypeOpen:
-		c.activeConns.Add(1)
-		var protocol byte = ProtocolTCP
-		if len(frame.Data) > 0 {
-			protocol = frame.Data[0]
+func (c *BleepConnector) authenticate(conn net.Conn) error {
+	payload := fmt.Sprintf("%s:%s\n", c.config.ClientID, c.config.AuthKey)
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		return err
+	}
+
+	conn.SetReadDeadline(time.Now().Add(dialTimeout))
+	defer conn.SetReadDeadline(time.Time{})
+
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err != nil {
+		return fmt.Errorf("failed to read auth response: %v", err)
+	}
+
+	if buf[0] == 0 {
+		return fmt.Errorf("auth rejected by server")
+	}
+	
+	if buf[0] != 1 {
+		return fmt.Errorf("unexpected auth response: %v", buf[0])
+	}
+
+	return nil
+}
+
+type DownstreamDialer interface {
+	Dial(ctx context.Context, proto Protocol) (net.Conn, error)
+}
+
+type LocalDialer struct {
+	target string
+}
+
+func (d *LocalDialer) Dial(ctx context.Context, proto Protocol) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: localDialTimeout}
+	return dialer.DialContext(ctx, proto.String(), d.target)
+}
+
+type Agent struct {
+	config    *Config
+	connector UpstreamConnector
+	dialer    DownstreamDialer
+}
+
+func NewAgent(cfg *Config) *Agent {
+	return &Agent{
+		config:    cfg,
+		connector: &BleepConnector{config: cfg},
+		dialer:    &LocalDialer{target: cfg.ServiceAddress},
+	}
+}
+
+func (a *Agent) Run(ctx context.Context) {
+	log.Printf("Starting Agent for %s -> %s", a.config.ClientID, a.config.ServiceAddress)
+
+	backoff := retryInterval
+	maxBackoff := 60 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if err := a.sessionLoop(ctx); err != nil {
+				log.Printf("Session error: %v. Retrying in %v...", err, backoff)
+				
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			} else {
+				backoff = retryInterval
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(retryInterval):
+				}
+			}
 		}
-		go c.handleNewChannel(frame.ChannelID, protocol)
-
-	case FrameTypeData:
-		c.mux.SafeSend(frame.ChannelID, frame)
-
-	case FrameTypeClose:
-		c.mux.CloseChannel(frame.ChannelID)
 	}
 }
 
-func (c *Client) handleNewChannel(channelID uint32, protocol byte) {
-	defer c.activeConns.Done()
+func (a *Agent) sessionLoop(ctx context.Context) error {
+	mux, err := a.connector.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer mux.Close()
 
-	var localConn net.Conn
-	var err error
+	log.Println("Connected to upstream")
 
-	if protocol == ProtocolUDP {
-		localConn, err = net.DialTimeout("udp", c.config.ServiceAddress, 5*time.Second)
-	} else {
-		localConn, err = net.DialTimeout("tcp", c.config.ServiceAddress, 5*time.Second)
+	errChan := make(chan error, 1)
+	mux.ReadLoop(func(frame *Frame) {
+		if frame.Type != FrameTypeOpen {
+			return
+		}
+		go a.handleOpen(ctx, mux, frame)
+	})
+	
+	return <-errChan
+}
+
+func (a *Agent) handleOpen(ctx context.Context, mux *Multiplexer, frame *Frame) {
+	proto := ProtocolTCP
+	priority := 0
+
+	if len(frame.Data) > 0 {
+		proto = Protocol(frame.Data[0])
+	}
+	if len(frame.Data) > 1 {
+		priority = int(frame.Data[1])
 	}
 
+	frame.Priority = priority
+
+	
+	conn, err := a.dialer.Dial(ctx, proto)
 	if err != nil {
-		c.mux.WriteFrame(&Frame{
-			Type:      FrameTypeClose,
-			ChannelID: channelID,
-		})
+		log.Printf("Dial local failed: %v", err)
+		mux.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: frame.ChannelID})
 		return
 	}
-	defer localConn.Close()
+	defer conn.Close()
 
-	if tcpConn, ok := localConn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	dataChan := c.mux.RegisterChannel(channelID)
+	stream := mux.RegisterChannel(frame.ChannelID, frame.Priority)
+	defer mux.CloseChannel(frame.ChannelID)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 65535)
-		for {
-			n, err := localConn.Read(buf)
-			if n > 0 {
-				if err := c.mux.WriteFrame(&Frame{
-					Type:      FrameTypeData,
-					ChannelID: channelID,
-					Data:      buf[:n],
-				}); err != nil {
-					return
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-		c.mux.WriteFrame(&Frame{
-			Type:      FrameTypeClose,
-			ChannelID: channelID,
-		})
+		a.pipeUp(mux, conn, frame.ChannelID)
 	}()
 
 	go func() {
 		defer wg.Done()
-		for frame := range dataChan {
-			if frame.Type == FrameTypeData && len(frame.Data) > 0 {
-				localConn.Write(frame.Data)
-			} else if frame.Type == FrameTypeClose {
-				localConn.Close()
-				break
-			}
-		}
+		a.pipeDown(conn, stream)
 	}()
 
 	wg.Wait()
-	c.mux.CloseChannel(channelID)
+}
+
+func (a *Agent) pipeUp(mux *Multiplexer, conn net.Conn, chID uint32) {
+	buf := make([]byte, readBufferSize)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			if err := mux.WriteFrame(&Frame{Type: FrameTypeData, ChannelID: chID, Data: data}); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			mux.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: chID})
+			return
+		}
+	}
+}
+
+func (a *Agent) pipeDown(conn net.Conn, stream chan *Frame) {
+	for frame := range stream {
+		if frame.Type == FrameTypeData {
+			conn.Write(frame.Data)
+		} else {
+			return
+		}
+	}
+}
+
+func main() {
+	configPath := flag.String("config", defaultConfigPath, "Path to config file")
+	flag.Parse()
+
+	data, err := os.ReadFile(*configPath)
+	if err != nil {
+		log.Fatalf("Read config: %v", err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Fatalf("Parse config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	agent := NewAgent(&cfg)
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		cancel()
+	}()
+
+	agent.Run(ctx)
 }
