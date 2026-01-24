@@ -19,8 +19,9 @@ import (
 )
 
 type PortConfig struct {
-	Port int    `json:"port"`
-	Key  string `json:"key"`
+	Port     int    `json:"port"`
+	Key      string `json:"key"`
+	Protocol string `json:"protocol"`
 }
 
 type ServerConfig struct {
@@ -208,6 +209,11 @@ func (s *Server) handleClientFrame(clientID string, frame *Frame) {
 }
 
 func (s *Server) listenForPublic(clientID string, portCfg PortConfig) {
+	if portCfg.Protocol == "udp" {
+		s.listenForPublicUDP(clientID, portCfg)
+		return
+	}
+
 	defer s.wg.Done()
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", portCfg.Port))
@@ -255,6 +261,7 @@ func (s *Server) handlePublic(publicConn net.Conn, clientID string) {
 	if err := mux.WriteFrame(&Frame{
 		Type:      FrameTypeOpen,
 		ChannelID: channelID,
+		Data:      []byte{ProtocolTCP},
 	}); err != nil {
 		mux.CloseChannel(channelID)
 		return
@@ -269,12 +276,10 @@ func (s *Server) handlePublic(publicConn net.Conn, clientID string) {
 		for {
 			n, err := publicConn.Read(buf)
 			if n > 0 {
-				data := make([]byte, n)
-				copy(data, buf[:n])
 				if err := mux.WriteFrame(&Frame{
 					Type:      FrameTypeData,
 					ChannelID: channelID,
-					Data:      data,
+					Data:      buf[:n],
 				}); err != nil {
 					return
 				}
@@ -302,4 +307,133 @@ func (s *Server) handlePublic(publicConn net.Conn, clientID string) {
 
 	wg.Wait()
 	mux.CloseChannel(channelID)
+}
+
+func (s *Server) listenForPublicUDP(clientID string, portCfg PortConfig) {
+	defer s.wg.Done()
+
+	addr := fmt.Sprintf(":%d", portCfg.Port)
+	pconn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		log.Fatalf("Failed to listen UDP on %s: %v", addr, err)
+	}
+
+	log.Printf("Listening for public UDP on %s (client: %s)", addr, clientID)
+
+	go func() {
+		<-s.stop
+		pconn.Close()
+	}()
+
+	type udpSession struct {
+		channelID  uint32
+		lastActive time.Time
+	}
+
+	sessions := make(map[string]*udpSession)
+	var sessMu sync.Mutex
+
+	// Cleanup routine for inactive sessions
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-ticker.C:
+				sessMu.Lock()
+				now := time.Now()
+				for key, sess := range sessions {
+					if now.Sub(sess.lastActive) > 60*time.Second {
+						s.clientsMutex.RLock()
+						mux := s.clients[clientID]
+						s.clientsMutex.RUnlock()
+						if mux != nil {
+							mux.CloseChannel(sess.channelID)
+							mux.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: sess.channelID})
+						}
+						delete(sessions, key)
+					}
+				}
+				sessMu.Unlock()
+			}
+		}
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		n, remoteAddr, err := pconn.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-s.stop:
+				return
+			default:
+				log.Printf("Read UDP error: %v", err)
+				continue
+			}
+		}
+
+		remoteKey := remoteAddr.String()
+
+		s.clientsMutex.RLock()
+		mux := s.clients[clientID]
+		s.clientsMutex.RUnlock()
+
+		if mux == nil {
+			continue
+		}
+
+		sessMu.Lock()
+		sess, exists := sessions[remoteKey]
+		if exists {
+			sess.lastActive = time.Now()
+		}
+		sessMu.Unlock()
+
+		if !exists {
+			channelID, dataChan := mux.OpenChannel()
+
+			if err := mux.WriteFrame(&Frame{
+				Type:      FrameTypeOpen,
+				ChannelID: channelID,
+				Data:      []byte{ProtocolUDP},
+			}); err != nil {
+				mux.CloseChannel(channelID)
+				continue
+			}
+
+			sess = &udpSession{
+				channelID:  channelID,
+				lastActive: time.Now(),
+			}
+
+			sessMu.Lock()
+			sessions[remoteKey] = sess
+			sessMu.Unlock()
+
+			// Handle return traffic from client -> udp public
+			go func(chID uint32, dChan chan *Frame, rAddr net.Addr) {
+				for frame := range dChan {
+					if frame.Type == FrameTypeData && len(frame.Data) > 0 {
+						pconn.WriteTo(frame.Data, rAddr)
+					} else if frame.Type == FrameTypeClose {
+						break
+					}
+				}
+				sessMu.Lock()
+				if s, ok := sessions[remoteKey]; ok && s.channelID == chID {
+					delete(sessions, remoteKey)
+				}
+				sessMu.Unlock()
+				mux.CloseChannel(chID)
+			}(channelID, dataChan, remoteAddr)
+		}
+
+		mux.WriteFrame(&Frame{
+			Type:      FrameTypeData,
+			ChannelID: sess.channelID,
+			Data:      buf[:n],
+		})
+	}
 }

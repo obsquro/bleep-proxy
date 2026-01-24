@@ -3,7 +3,8 @@
   "public_listen_ports": {
     "web-server": {
       "port": 80,
-      "key": "supersecretkey"
+      "key": "supersecretkey",
+      "protocol": "tcp"
     }
   }
 }

@@ -12,6 +12,9 @@ const (
 	FrameTypeData  byte = 0x01
 	FrameTypeOpen  byte = 0x02
 	FrameTypeClose byte = 0x03
+
+	ProtocolTCP byte = 0x00
+	ProtocolUDP byte = 0x01
 )
 
 type Frame struct {

@@ -152,7 +152,11 @@ func (c *Client) handleFrame(frame *Frame) {
 	switch frame.Type {
 	case FrameTypeOpen:
 		c.activeConns.Add(1)
-		go c.handleNewChannel(frame.ChannelID)
+		var protocol byte = ProtocolTCP
+		if len(frame.Data) > 0 {
+			protocol = frame.Data[0]
+		}
+		go c.handleNewChannel(frame.ChannelID, protocol)
 
 	case FrameTypeData:
 		c.mux.SafeSend(frame.ChannelID, frame)
@@ -162,10 +166,18 @@ func (c *Client) handleFrame(frame *Frame) {
 	}
 }
 
-func (c *Client) handleNewChannel(channelID uint32) {
+func (c *Client) handleNewChannel(channelID uint32, protocol byte) {
 	defer c.activeConns.Done()
 
-	localConn, err := net.DialTimeout("tcp", c.config.ServiceAddress, 5*time.Second)
+	var localConn net.Conn
+	var err error
+
+	if protocol == ProtocolUDP {
+		localConn, err = net.DialTimeout("udp", c.config.ServiceAddress, 5*time.Second)
+	} else {
+		localConn, err = net.DialTimeout("tcp", c.config.ServiceAddress, 5*time.Second)
+	}
+
 	if err != nil {
 		c.mux.WriteFrame(&Frame{
 			Type:      FrameTypeClose,
@@ -187,16 +199,14 @@ func (c *Client) handleNewChannel(channelID uint32) {
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32768)
+		buf := make([]byte, 65535)
 		for {
 			n, err := localConn.Read(buf)
 			if n > 0 {
-				data := make([]byte, n)
-				copy(data, buf[:n])
 				if err := c.mux.WriteFrame(&Frame{
 					Type:      FrameTypeData,
 					ChannelID: channelID,
-					Data:      data,
+					Data:      buf[:n],
 				}); err != nil {
 					return
 				}
