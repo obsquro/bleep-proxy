@@ -1,7 +1,7 @@
 {
-  "auth_key": "Dayh1234!",
+  "auth_key": "hytalekey1234",
   "client_id": "hytale",
-  "service_address": "127.0.0.1:5520",
-  "server_address": "194.156.118.228",
+  "service_address": "[SERVICE_ADDRESS]",
+  "server_address": "[SERVER_ADDRESS]",
   "server_port": "7000"
 }
