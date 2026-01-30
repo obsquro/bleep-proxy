@@ -50,9 +50,24 @@ type ListenerConfig struct {
 	Priority     int    `json:"priority"`
 }
 
+// --- Interfaces ---
+
 type Authenticator interface {
 	Authenticate(id, key string) bool
 }
+
+type TunnelRegistry interface {
+	Register(id string, tunnel *Multiplexer)
+	Unregister(id string)
+	Get(id string) *Multiplexer
+	Range(f func(id string, tunnel *Multiplexer) bool)
+}
+
+type Listener interface {
+	Start(ctx context.Context)
+}
+
+// --- Authenticator Implementation ---
 
 type InMemoryAuthenticator struct {
 	users map[string]string
@@ -72,12 +87,7 @@ func (a *InMemoryAuthenticator) Authenticate(id, key string) bool {
 }
 
 
-type TunnelRegistry interface {
-	Register(id string, tunnel *Multiplexer)
-	Unregister(id string)
-	Get(id string) *Multiplexer
-	Range(f func(id string, tunnel *Multiplexer) bool)
-}
+// --- Registry Implementation ---
 
 type InMemoryRegistry struct {
 	tunnels map[string]*Multiplexer
@@ -119,10 +129,6 @@ func (r *InMemoryRegistry) Get(id string) *Multiplexer {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.tunnels[id]
-}
-
-type Listener interface {
-	Start(ctx context.Context)
 }
 
 type Server struct {
@@ -235,10 +241,14 @@ func (s *Server) runStatsServer(ctx context.Context) {
 
 	port := s.config.StatsPort
 	if port == "" {
-		port = "8080" 
+		port = "8080"
 	}
-	server := &http.Server{Addr: ":" + port, Handler: mux}
-	
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+
 	log.Printf("Starting Stats Server on :%s", port)
 
 	go func() {
@@ -285,37 +295,49 @@ func (s *Server) runClientListener(ctx context.Context) {
 }
 
 func (s *Server) handleClientConnection(conn net.Conn) {
-	id, key, err := s.handshake(conn)
-	if err != nil {
-		log.Printf("Handshake failed: %v", err)
-		conn.Close()
-		return
-	}
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("Recovered from panic in client session: %v", r)
+        }
+    }()
+    
+    id, key, err := s.handshake(conn)
+    if err != nil {
+        log.Printf("Handshake failed: %v", err)
+        conn.Close()
+        return
+    }
 
-	if !s.auth.Authenticate(id, key) {
-		log.Printf("Authentication failed for %s", id)
-		conn.Write([]byte{0})
-		conn.Close()
-		return
-	}
+    if !s.auth.Authenticate(id, key) {
+        log.Printf("Authentication failed for %s", id)
+        conn.Write([]byte{0}) 
+        conn.Close()
+        return
+    }
 
+    if _, err := conn.Write([]byte{1}); err != nil {
+        log.Printf("Failed to send auth success to %s: %v", id, err)
+        conn.Close()
+        return
+    }
 
-	if _, err := conn.Write([]byte{1}); err != nil {
-		log.Printf("Failed to send auth success: %v", err)
-		conn.Close()
-		return
-	}
+    log.Printf("Client connected: %s", id)
+    
+    mux := NewMultiplexer(conn)
+    s.registry.Register(id, mux)
 
-	log.Printf("Client connected: %s", id)
-	mux := NewMultiplexer(conn)
-	s.registry.Register(id, mux)
+    defer func() {
+        s.registry.Unregister(id)
+        mux.Close() 
+        log.Printf("Client disconnected and cleaned up: %s", id)
+    }()
 
-	mux.ReadLoop(func(frame *Frame) {
-		log.Printf("Unexpected frame from client %s: %v", id, frame.Type)
-	})
-
-	s.registry.Unregister(id)
-	log.Printf("Client disconnected: %s", id)
+    mux.ReadLoop(func(frame *Frame) {
+        if frame.Type == FrameTypeClose {
+            mux.CloseChannel(frame.ChannelID)
+            log.Printf("Channel %d closed by client %s", frame.ChannelID, id)
+        }
+    })
 }
 
 func (s *Server) handshake(conn net.Conn) (string, string, error) {
@@ -400,14 +422,21 @@ func (l *TCPListener) Start(ctx context.Context) {
 }
 
 func (l *TCPListener) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[TCP] Recovered from panic in handleConn: %v", r)
+		}
+		conn.Close()
+	}()
 
 	tunnel := l.registry.Get(l.target)
 	if tunnel == nil {
+		log.Printf("Target client %s not connected, dropping TCP connection on :%d", l.target, l.port)
 		return
 	}
 
 	chID, stream := tunnel.OpenChannel(l.priority)
+	log.Printf("[CH %d] New TCP connection on :%d -> %s", chID, l.port, l.target)
 
 	payload := []byte{byte(ProtocolTCP), byte(l.priority)}
 	if err := tunnel.WriteFrame(&Frame{Type: FrameTypeOpen, ChannelID: chID, Data: payload}); err != nil {
@@ -558,6 +587,12 @@ func (m *UDPSessionManager) prune() {
 }
 
 func (m *UDPSessionManager) HandlePacket(addr net.Addr, data []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[UDP] Recovered from panic in HandlePacket: %v", r)
+		}
+	}()
+
 	tunnel := m.registry.Get(m.target)
 	if tunnel == nil {
 		return
@@ -583,6 +618,7 @@ func (m *UDPSessionManager) HandlePacket(addr net.Addr, data []byte) {
 
 func (m *UDPSessionManager) createSession(key string, addr net.Addr, tunnel *Multiplexer) *UDPSession {
 	chID, stream := tunnel.OpenChannel(m.priority)
+	log.Printf("[CH %d] New UDP session %s -> %s", chID, key, m.target)
 
 	payload := []byte{byte(ProtocolUDP), byte(m.priority)}
 	if err := tunnel.WriteFrame(&Frame{Type: FrameTypeOpen, ChannelID: chID, Data: payload}); err != nil {

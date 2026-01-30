@@ -5,41 +5,30 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
-
-	"github.com/pierrec/lz4/v4"
 )
 
+// Frame types
 const (
 	FrameTypeData           byte = 0x01
 	FrameTypeOpen           byte = 0x02
 	FrameTypeClose          byte = 0x03
 	FrameTypeCompressedData byte = 0x04
-
-	ProtocolTCP Protocol = 0x00
-	ProtocolUDP Protocol = 0x01
-
-	ChannelBufferSize = 128
-	QueueSize         = 1024
-	CompressionThresh = 512
 )
 
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 65535) 
-		return &b
-	},
-}
+// Supported protocols
+const (
+	ProtocolTCP Protocol = 0x00
+	ProtocolUDP Protocol = 0x01
+)
 
-func GetBuffer() *[]byte {
-	return bufferPool.Get().(*[]byte)
-}
-
-func PutBuffer(b *[]byte) {
-	bufferPool.Put(b)
-}
+const (
+	ChannelBufferSize = 128
+	QueueSize         = 1024
+)
 
 type PacketHeap []*Frame
 
@@ -113,49 +102,38 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 
 	dataLen := binary.BigEndian.Uint32(header[5:9])
 	if dataLen > 0 {
-		if frame.Type != FrameTypeCompressedData {
-			frame.Data = make([]byte, dataLen)
-			if _, err := io.ReadFull(r, frame.Data); err != nil {
-				return nil, err
-			}
-		} else {
-			compressed := make([]byte, dataLen)
-			if _, err := io.ReadFull(r, compressed); err != nil {
-				return nil, err
-			}
-			
-			decompressed := make([]byte, 65535)
-			n, err := lz4.UncompressBlock(compressed, decompressed)
-			if err != nil {
-				return nil, fmt.Errorf("decompression error: %v", err)
-			}
-			frame.Data = decompressed[:n]
-			frame.Type = FrameTypeData
+		// Limit data length to avoid OOM
+		if dataLen > 10*1024*1024 {
+			return nil, fmt.Errorf("frame data too large: %d", dataLen)
+		}
+		frame.Data = make([]byte, dataLen)
+		if _, err := io.ReadFull(r, frame.Data); err != nil {
+			return nil, err
 		}
 	}
-
 	return frame, nil
 }
 
 type Multiplexer struct {
 	conn      net.Conn
-	channels  map[uint32]chan *Frame
 	mu        sync.RWMutex
+	channels  map[uint32]chan *Frame
+	closedChs map[uint32]bool
+	closed    bool
 
-	outQueue     PacketHeap
-	queueCond    *sync.Cond
+	// Priority queue for outgoing frames
 	queueMu      sync.Mutex
+	queueCond    *sync.Cond
+	outQueue     PacketHeap
+	writeOrder   uint64
 	chanPriority map[uint32]int
 	prioMu       sync.RWMutex
 
-	nextID     uint32
-	writeOrder uint64
-	closed     bool
-	closedChs  map[uint32]bool
+	nextID uint32
 
+	// Statistics
 	BytesSent     uint64
 	BytesReceived uint64
-	ActiveTunnels int64
 }
 
 func NewMultiplexer(conn net.Conn) *Multiplexer {
@@ -173,8 +151,6 @@ func NewMultiplexer(conn net.Conn) *Multiplexer {
 }
 
 func (m *Multiplexer) writeLoop() {
-	compressBuffer := make([]byte, 65535)
-
 	for {
 		m.queueMu.Lock()
 		for m.outQueue.Len() == 0 {
@@ -184,20 +160,9 @@ func (m *Multiplexer) writeLoop() {
 			}
 			m.queueCond.Wait()
 		}
-		
+
 		frame := heap.Pop(&m.outQueue).(*Frame)
 		m.queueMu.Unlock()
-
-		if frame.Type == FrameTypeData && len(frame.Data) > CompressionThresh {
-			ht := make([]int, 65536)
-			n, err := lz4.CompressBlock(frame.Data, compressBuffer, ht)
-			if err == nil && n < len(frame.Data) {
-				compressedData := make([]byte, n)
-				copy(compressedData, compressBuffer[:n])
-				frame.Data = compressedData
-				frame.Type = FrameTypeCompressedData
-			}
-		}
 
 		if err := frame.WriteTo(m.conn); err != nil {
 			m.Close()
@@ -236,24 +201,38 @@ func (m *Multiplexer) WriteFrame(frame *Frame) error {
 }
 
 func (m *Multiplexer) ReadLoop(handler func(*Frame)) {
-	for {
-		frame, err := ReadFrame(m.conn)
-		if err != nil {
-			m.Close()
-			return
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Mux] Recovered from panic in ReadLoop: %v", r)
 		}
-		atomic.AddUint64(&m.BytesReceived, uint64(len(frame.Data)+9))
+	}()
 
-		m.mu.RLock()
-		ch, exists := m.channels[frame.ChannelID]
-		m.mu.RUnlock()
+    for {
+        frame, err := ReadFrame(m.conn)
+        if err != nil {
+            m.Close()
+            return
+        }
+        atomic.AddUint64(&m.BytesReceived, uint64(len(frame.Data)+9))
 
-		if exists && (frame.Type == FrameTypeData || frame.Type == FrameTypeClose || frame.Type == FrameTypeCompressedData) {
-			ch <- frame
-		} else {
-			handler(frame)
-		}
-	}
+        m.mu.RLock()
+        ch, exists := m.channels[frame.ChannelID]
+        m.mu.RUnlock()
+
+        if exists && (frame.Type == FrameTypeData || frame.Type == FrameTypeClose || frame.Type == FrameTypeCompressedData) {
+            func() {
+                defer func() { recover() }()
+                
+                select {
+				case ch <- frame:
+				default:
+					// Log dropped frames if necessary, but keep it quiet for now
+				}
+            }()
+        } else {
+            handler(frame)
+        }
+    }
 }
 
 func (m *Multiplexer) OpenChannel(priority int) (uint32, chan *Frame) {
@@ -295,18 +274,21 @@ func (m *Multiplexer) GetChannel(channelID uint32) (chan *Frame, bool) {
 }
 
 func (m *Multiplexer) CloseChannel(channelID uint32) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+    m.mu.Lock()
+    defer m.mu.Unlock()
 
-	if m.closedChs[channelID] {
-		return
-	}
+    ch, exists := m.channels[channelID]
+    if !exists {
+        return
+    }
 
-	if ch, exists := m.channels[channelID]; exists {
-		m.closedChs[channelID] = true
-		close(ch)
-		delete(m.channels, channelID)
-	}
+    delete(m.channels, channelID)
+    m.closedChs[channelID] = true
+    
+    go func(c chan *Frame) {
+        defer func() { recover() }()
+        close(c)
+    }(ch)
 }
 
 func (m *Multiplexer) SafeSend(channelID uint32, frame *Frame) bool {
@@ -331,22 +313,27 @@ func (m *Multiplexer) SafeSend(channelID uint32, frame *Frame) bool {
 }
 
 func (m *Multiplexer) Close() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+    m.mu.Lock()
+    if m.closed {
+        m.mu.Unlock()
+        return
+    }
+    m.closed = true
+    
+    channelsToClose := m.channels
+    m.channels = make(map[uint32]chan *Frame)
+    m.mu.Unlock()
 
-	if m.closed {
-		return
-	}
-	m.closed = true
+    m.queueMu.Lock()
+    m.queueCond.Broadcast()
+    m.queueMu.Unlock()
 
-	m.queueMu.Lock()
-	m.closed = true
-	m.queueCond.Broadcast()
-	m.queueMu.Unlock()
+    m.conn.Close()
 
-	for _, ch := range m.channels {
-		close(ch)
-	}
-	m.channels = make(map[uint32]chan *Frame)
-	m.conn.Close()
+    for _, ch := range channelsToClose {
+        func() {
+            defer func() { recover() }()
+            close(ch)
+        }()
+    }
 }

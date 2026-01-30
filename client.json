@@ -1,7 +1,7 @@
 {
-  "auth_key": "supersecretkey",
-  "client_id": "web-server",
-  "service_address": "localhost:3000",
-  "server_address": "YOUR_VPS_IP",
+  "auth_key": "Dayh1234!",
+  "client_id": "hytale",
+  "service_address": "127.0.0.1:5520",
+  "server_address": "194.156.118.228",
   "server_port": "7000"
 }

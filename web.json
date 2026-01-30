@@ -1,0 +1,7 @@
+{
+  "auth_key": "webkey",
+  "client_id": "web",
+  "service_address": "localhost:5173",
+  "server_address": "194.156.118.228",
+  "server_port": "7000"
+}

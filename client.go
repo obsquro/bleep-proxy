@@ -100,8 +100,26 @@ type LocalDialer struct {
 }
 
 func (d *LocalDialer) Dial(ctx context.Context, proto Protocol) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: localDialTimeout}
-	return dialer.DialContext(ctx, proto.String(), d.target)
+    if proto == ProtocolUDP {
+        pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+        if err != nil {
+            return nil, err
+        }
+        
+        addr, err := net.ResolveUDPAddr("udp", d.target)
+        if err != nil {
+            pc.Close()
+            return nil, err
+        }
+
+        return &udpConnWrapper{
+            PacketConn: pc,
+            target:     addr,
+        }, nil
+    }
+    
+    dialer := net.Dialer{Timeout: localDialTimeout}
+    return dialer.DialContext(ctx, proto.String(), d.target)
 }
 
 type Agent struct {
@@ -130,8 +148,11 @@ func (a *Agent) Run(ctx context.Context) {
 			return
 		default:
 			if err := a.sessionLoop(ctx); err != nil {
-				log.Printf("Session error: %v. Retrying in %v...", err, backoff)
-				
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[Agent] Session error: %v. Retrying in %v...", err, backoff)
+
 				select {
 				case <-ctx.Done():
 					return
@@ -155,89 +176,106 @@ func (a *Agent) Run(ctx context.Context) {
 }
 
 func (a *Agent) sessionLoop(ctx context.Context) error {
-	mux, err := a.connector.Connect(ctx)
-	if err != nil {
-		return err
-	}
-	defer mux.Close()
+    mux, err := a.connector.Connect(ctx)
+    if err != nil {
+        return err
+    }
+    defer mux.Close()
 
-	log.Println("Connected to upstream")
+    exitChan := make(chan struct{})
+    go func() {
+        mux.ReadLoop(func(frame *Frame) {
+            if frame.Type == FrameTypeOpen {
+                go a.handleOpen(ctx, mux, frame)
+            }
+        })
+        close(exitChan)
+    }()
 
-	errChan := make(chan error, 1)
-	mux.ReadLoop(func(frame *Frame) {
-		if frame.Type != FrameTypeOpen {
-			return
-		}
-		go a.handleOpen(ctx, mux, frame)
-	})
-	
-	return <-errChan
+    select {
+    case <-ctx.Done():
+        mux.Close() 
+        return ctx.Err()
+    case <-exitChan:
+        return fmt.Errorf("multiplexer read loop stopped")
+    }
 }
 
 func (a *Agent) handleOpen(ctx context.Context, mux *Multiplexer, frame *Frame) {
-	proto := ProtocolTCP
-	priority := 0
+    proto := ProtocolTCP
+    priority := 0
 
-	if len(frame.Data) > 0 {
-		proto = Protocol(frame.Data[0])
-	}
-	if len(frame.Data) > 1 {
-		priority = int(frame.Data[1])
-	}
+    if len(frame.Data) > 0 {
+        proto = Protocol(frame.Data[0])
+    }
+    if len(frame.Data) > 1 {
+        priority = int(frame.Data[1])
+    }
 
-	frame.Priority = priority
+    frame.Priority = priority
 
-	
-	conn, err := a.dialer.Dial(ctx, proto)
-	if err != nil {
-		log.Printf("Dial local failed: %v", err)
-		mux.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: frame.ChannelID})
-		return
-	}
-	defer conn.Close()
+    log.Printf("Opening local tunnel: Proto=%s, ID=%d", proto.String(), frame.ChannelID)
 
-	stream := mux.RegisterChannel(frame.ChannelID, frame.Priority)
-	defer mux.CloseChannel(frame.ChannelID)
+    dialCtx, cancel := context.WithTimeout(ctx, localDialTimeout)
+    defer cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+    conn, err := a.dialer.Dial(dialCtx, proto)
+    if err != nil {
+        log.Printf("Could not connect to local service at %s: %v", a.config.ServiceAddress, err)
+        mux.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: frame.ChannelID})
+        return
+    }
 
-	go func() {
-		defer wg.Done()
-		a.pipeUp(mux, conn, frame.ChannelID)
-	}()
+    stream := mux.RegisterChannel(frame.ChannelID, frame.Priority)
 
-	go func() {
-		defer wg.Done()
-		a.pipeDown(conn, stream)
-	}()
+    var wg sync.WaitGroup
+    wg.Add(2)
 
-	wg.Wait()
+    go func() {
+        defer wg.Done()
+        a.pipeUp(mux, conn, frame.ChannelID)
+        mux.CloseChannel(frame.ChannelID) 
+    }()
+
+    go func() {
+        defer wg.Done()
+        a.pipeDown(conn, stream)
+    }()
+
+    go func() {
+        wg.Wait()
+        conn.Close()
+        log.Printf("Local tunnel closed: ID=%d", frame.ChannelID)
+    }()
 }
 
 func (a *Agent) pipeUp(mux *Multiplexer, conn net.Conn, chID uint32) {
-	buf := make([]byte, readBufferSize)
-	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			data := make([]byte, n)
-			copy(data, buf[:n])
-			if err := mux.WriteFrame(&Frame{Type: FrameTypeData, ChannelID: chID, Data: data}); err != nil {
-				return
-			}
-		}
-		if err != nil {
-			mux.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: chID})
-			return
-		}
-	}
+    buf := make([]byte, readBufferSize)
+    for {
+        n, err := conn.Read(buf)
+        if n > 0 {
+            data := make([]byte, n)
+            copy(data, buf[:n])
+            if err := mux.WriteFrame(&Frame{Type: FrameTypeData, ChannelID: chID, Data: data}); err != nil {
+                log.Printf("[CH %d] Tunnel write error (connection lost), stopping pipeUp", chID)
+                return 
+            }
+        }
+        if err != nil {
+            mux.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: chID})
+            return
+        }
+    }
 }
 
 func (a *Agent) pipeDown(conn net.Conn, stream chan *Frame) {
 	for frame := range stream {
-		if frame.Type == FrameTypeData {
-			conn.Write(frame.Data)
-		} else {
+		if frame.Type != FrameTypeData {
+			return
+		}
+
+		if _, err := conn.Write(frame.Data); err != nil {
+			log.Printf("[CH %d] Local write error: %v", frame.ChannelID, err)
 			return
 		}
 	}
@@ -269,3 +307,23 @@ func main() {
 
 	agent.Run(ctx)
 }
+
+type udpConnWrapper struct {
+    net.PacketConn
+    target net.Addr
+}
+
+func (w *udpConnWrapper) Read(b []byte) (int, error) {
+    n, _, err := w.ReadFrom(b)
+    return n, err
+}
+
+func (w *udpConnWrapper) Write(b []byte) (int, error) {
+    return w.WriteTo(b, w.target)
+}
+
+func (w *udpConnWrapper) LocalAddr() net.Addr  { return w.PacketConn.LocalAddr() }
+func (w *udpConnWrapper) RemoteAddr() net.Addr { return w.target }
+func (w *udpConnWrapper) SetDeadline(t time.Time) error      { return w.PacketConn.SetDeadline(t) }
+func (w *udpConnWrapper) SetReadDeadline(t time.Time) error  { return w.PacketConn.SetReadDeadline(t) }
+func (w *udpConnWrapper) SetWriteDeadline(t time.Time) error { return w.PacketConn.SetWriteDeadline(t) }

@@ -4,11 +4,11 @@
   "users": [
     {
       "id": "hytale",
-      "key": "hytalekey"
+      "key": "Dayh1234!"
     },
     {
-      "id": "web-server",
-      "key": "supersecretkey"
+      "id": "web",
+      "key": "webkey"
     }
   ],
   "listeners": [
@@ -27,7 +27,7 @@
     {
       "protocol": "tcp",
       "port": 1337,
-      "target_client": "web-server",
+      "target_client": "web",
       "priority": 0
     }
   ]
