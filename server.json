@@ -1,33 +1,17 @@
 {
-  "client_listen_port": "7000",
-  "stats_port": "8080",
-  "users": [
+  "port": "7000",
+  "api": "8080",
+  "clients": [
     {
-      "id": "hytale",
-      "key": "hytalekey1234"
-    },
-    {
-      "id": "web",
-      "key": "webkey1234"
+      "id": "minecraft",
+      "key": "dayh1234"
     }
   ],
   "listeners": [
     {
+      "client": "minecraft",
+      "port": 25565,
       "protocol": "tcp",
-      "port": 5520,
-      "target_client": "hytale",
-      "priority": 0
-    },
-    {
-      "protocol": "udp",
-      "port": 5520,
-      "target_client": "hytale",
-      "priority": 1
-    },
-    {
-      "protocol": "tcp",
-      "port": 1337,
-      "target_client": "web",
       "priority": 0
     }
   ]

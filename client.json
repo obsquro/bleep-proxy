@@ -1,7 +1,6 @@
 {
-  "auth_key": "hytalekey1234",
-  "client_id": "hytale",
-  "service_address": "[SERVICE_ADDRESS]",
-  "server_address": "[SERVER_ADDRESS]",
-  "server_port": "7000"
+  "id": "minecraft",
+  "key": "dayh1234",
+  "local": "192.168.0.13:25565",
+  "server": "155.212.147.144:7000"
 }

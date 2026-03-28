@@ -5,21 +5,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 )
 
-// Frame types
 const (
-	FrameTypeData           byte = 0x01
-	FrameTypeOpen           byte = 0x02
-	FrameTypeClose          byte = 0x03
-	FrameTypeCompressedData byte = 0x04
+	FrameTypeData  byte = 0x01
+	FrameTypeOpen  byte = 0x02
+	FrameTypeClose byte = 0x03
 )
 
-// Supported protocols
 const (
 	ProtocolTCP Protocol = 0x00
 	ProtocolUDP Protocol = 0x01
@@ -27,31 +23,8 @@ const (
 
 const (
 	ChannelBufferSize = 128
-	QueueSize         = 1024
+	MaxFrameSize      = 10 * 1024 * 1024
 )
-
-type PacketHeap []*Frame
-
-func (h PacketHeap) Len() int { return len(h) }
-func (h PacketHeap) Less(i, j int) bool {
-	if h[i].Priority == h[j].Priority {
-		return h[i].Order < h[j].Order 
-	}
-	return h[i].Priority > h[j].Priority
-}
-func (h PacketHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-
-func (h *PacketHeap) Push(x interface{}) {
-	*h = append(*h, x.(*Frame))
-}
-
-func (h *PacketHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
-}
 
 type Protocol byte
 
@@ -101,39 +74,56 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	}
 
 	dataLen := binary.BigEndian.Uint32(header[5:9])
+	if dataLen > MaxFrameSize {
+		return nil, fmt.Errorf("frame too large: %d", dataLen)
+	}
+
 	if dataLen > 0 {
-		// Limit data length to avoid OOM
-		if dataLen > 10*1024*1024 {
-			return nil, fmt.Errorf("frame data too large: %d", dataLen)
-		}
 		frame.Data = make([]byte, dataLen)
 		if _, err := io.ReadFull(r, frame.Data); err != nil {
 			return nil, err
 		}
 	}
+
 	return frame, nil
 }
 
-type Multiplexer struct {
-	conn      net.Conn
-	mu        sync.RWMutex
-	channels  map[uint32]chan *Frame
-	closedChs map[uint32]bool
-	closed    bool
+type PacketHeap []*Frame
 
-	// Priority queue for outgoing frames
+func (h PacketHeap) Len() int { return len(h) }
+func (h PacketHeap) Less(i, j int) bool {
+	if h[i].Priority == h[j].Priority {
+		return h[i].Order < h[j].Order
+	}
+	return h[i].Priority > h[j].Priority
+}
+func (h PacketHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *PacketHeap) Push(x interface{}) {
+	*h = append(*h, x.(*Frame))
+}
+func (h *PacketHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+type Multiplexer struct {
+	conn         net.Conn
+	mu           sync.RWMutex
+	channels     map[uint32]chan *Frame
+	closedChs    map[uint32]bool
+	closed       bool
 	queueMu      sync.Mutex
 	queueCond    *sync.Cond
 	outQueue     PacketHeap
 	writeOrder   uint64
 	chanPriority map[uint32]int
 	prioMu       sync.RWMutex
-
-	nextID uint32
-
-	// Statistics
-	BytesSent     uint64
-	BytesReceived uint64
+	nextID       uint32
+	BytesSent    uint64
+	BytesRecv    uint64
 }
 
 func NewMultiplexer(conn net.Conn) *Multiplexer {
@@ -151,6 +141,11 @@ func NewMultiplexer(conn net.Conn) *Multiplexer {
 }
 
 func (m *Multiplexer) writeLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+		}
+	}()
+
 	for {
 		m.queueMu.Lock()
 		for m.outQueue.Len() == 0 {
@@ -160,7 +155,6 @@ func (m *Multiplexer) writeLoop() {
 			}
 			m.queueCond.Wait()
 		}
-
 		frame := heap.Pop(&m.outQueue).(*Frame)
 		m.queueMu.Unlock()
 
@@ -203,36 +197,28 @@ func (m *Multiplexer) WriteFrame(frame *Frame) error {
 func (m *Multiplexer) ReadLoop(handler func(*Frame)) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[Mux] Recovered from panic in ReadLoop: %v", r)
 		}
+		m.Close()
 	}()
 
-    for {
-        frame, err := ReadFrame(m.conn)
-        if err != nil {
-            m.Close()
-            return
-        }
-        atomic.AddUint64(&m.BytesReceived, uint64(len(frame.Data)+9))
+	for {
+		frame, err := ReadFrame(m.conn)
+		if err != nil {
+			return
+		}
 
-        m.mu.RLock()
-        ch, exists := m.channels[frame.ChannelID]
-        m.mu.RUnlock()
+		atomic.AddUint64(&m.BytesRecv, uint64(len(frame.Data)+9))
 
-        if exists && (frame.Type == FrameTypeData || frame.Type == FrameTypeClose || frame.Type == FrameTypeCompressedData) {
-            func() {
-                defer func() { recover() }()
-                
-                select {
-				case ch <- frame:
-				default:
-					// Log dropped frames if necessary, but keep it quiet for now
-				}
-            }()
-        } else {
-            handler(frame)
-        }
-    }
+		m.mu.RLock()
+		ch, exists := m.channels[frame.ChannelID]
+		m.mu.RUnlock()
+
+		if exists && (frame.Type == FrameTypeData || frame.Type == FrameTypeClose) {
+			ch <- frame
+		} else {
+			handler(frame)
+		}
+	}
 }
 
 func (m *Multiplexer) OpenChannel(priority int) (uint32, chan *Frame) {
@@ -258,7 +244,7 @@ func (m *Multiplexer) RegisterChannel(channelID uint32, priority int) chan *Fram
 
 	ch := make(chan *Frame, ChannelBufferSize)
 	m.channels[channelID] = ch
-	
+
 	m.prioMu.Lock()
 	m.chanPriority[channelID] = priority
 	m.prioMu.Unlock()
@@ -266,74 +252,52 @@ func (m *Multiplexer) RegisterChannel(channelID uint32, priority int) chan *Fram
 	return ch
 }
 
-func (m *Multiplexer) GetChannel(channelID uint32) (chan *Frame, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	ch, exists := m.channels[channelID]
-	return ch, exists
-}
-
 func (m *Multiplexer) CloseChannel(channelID uint32) {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-
-    ch, exists := m.channels[channelID]
-    if !exists {
-        return
-    }
-
-    delete(m.channels, channelID)
-    m.closedChs[channelID] = true
-    
-    go func(c chan *Frame) {
-        defer func() { recover() }()
-        close(c)
-    }(ch)
-}
-
-func (m *Multiplexer) SafeSend(channelID uint32, frame *Frame) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if m.closed || m.closedChs[channelID] {
-		return false
-	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	ch, exists := m.channels[channelID]
 	if !exists {
-		return false
+		return
 	}
 
-	select {
-	case ch <- frame:
-		return true
-	default:
-		return false
-	}
+	delete(m.channels, channelID)
+	m.closedChs[channelID] = true
+
+	go func(c chan *Frame) {
+		defer func() { recover() }()
+		close(c)
+	}(ch)
 }
 
 func (m *Multiplexer) Close() {
-    m.mu.Lock()
-    if m.closed {
-        m.mu.Unlock()
-        return
-    }
-    m.closed = true
-    
-    channelsToClose := m.channels
-    m.channels = make(map[uint32]chan *Frame)
-    m.mu.Unlock()
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.closed = true
+	channelsToClose := m.channels
+	m.channels = make(map[uint32]chan *Frame)
+	m.mu.Unlock()
 
-    m.queueMu.Lock()
-    m.queueCond.Broadcast()
-    m.queueMu.Unlock()
+	m.queueMu.Lock()
+	m.queueCond.Broadcast()
+	m.queueMu.Unlock()
 
-    m.conn.Close()
+	m.conn.Close()
 
-    for _, ch := range channelsToClose {
-        func() {
-            defer func() { recover() }()
-            close(ch)
-        }()
-    }
+	for _, ch := range channelsToClose {
+		func() {
+			defer func() { recover() }()
+			close(ch)
+		}()
+	}
+}
+
+func (m *Multiplexer) GetStats() (sent, recv uint64, channels int) {
+	m.mu.RLock()
+	channels = len(m.channels)
+	m.mu.RUnlock()
+	return atomic.LoadUint64(&m.BytesSent), atomic.LoadUint64(&m.BytesRecv), channels
 }

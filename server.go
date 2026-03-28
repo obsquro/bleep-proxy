@@ -9,48 +9,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-const (
-	defaultConfigPath = "server.json"
-	readBufferSize    = 32 * 1024
-	udpBufferSize     = 65535
-	handshakeTimeout  = 10 * time.Second
-	keepAlivePeriod   = 30 * time.Second
-	cleanupInterval   = 30 * time.Second
-	sessionTimeout    = 60 * time.Second
-)
 
-type Config struct {
-	ClientListenPort string           `json:"client_listen_port"`
-	StatsPort        string           `json:"stats_port"`
-	Users            []UserConfig     `json:"users"`
-	Listeners        []ListenerConfig `json:"listeners"`
-}
-
-type UserConfig struct {
-	ID  string `json:"id"`
-	Key string `json:"key"`
-}
-
-type ListenerConfig struct {
-	Protocol     string `json:"protocol"`
-	Port         int    `json:"port"`
-	TargetClient string `json:"target_client"`
-	Priority     int    `json:"priority"`
-}
-
-// --- Interfaces ---
 
 type Authenticator interface {
 	Authenticate(id, key string) bool
@@ -67,41 +36,26 @@ type Listener interface {
 	Start(ctx context.Context)
 }
 
-// --- Authenticator Implementation ---
-
 type InMemoryAuthenticator struct {
-	users map[string]string
+	clients map[string]string
 }
 
-func NewInMemoryAuthenticator(users []UserConfig) *InMemoryAuthenticator {
+func NewInMemoryAuthenticator(clients []ClientAuth) *InMemoryAuthenticator {
 	m := make(map[string]string)
-	for _, u := range users {
-		m[u.ID] = u.Key
+	for _, c := range clients {
+		m[c.ID] = c.Key
 	}
-	return &InMemoryAuthenticator{users: m}
+	return &InMemoryAuthenticator{clients: m}
 }
 
 func (a *InMemoryAuthenticator) Authenticate(id, key string) bool {
-	storedKey, ok := a.users[id]
+	storedKey, ok := a.clients[id]
 	return ok && storedKey == key
 }
-
-
-// --- Registry Implementation ---
 
 type InMemoryRegistry struct {
 	tunnels map[string]*Multiplexer
 	mu      sync.RWMutex
-}
-
-func (r *InMemoryRegistry) Range(f func(id string, tunnel *Multiplexer) bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	for id, t := range r.tunnels {
-		if !f(id, t) {
-			break
-		}
-	}
 }
 
 func NewInMemoryRegistry() *InMemoryRegistry {
@@ -131,73 +85,80 @@ func (r *InMemoryRegistry) Get(id string) *Multiplexer {
 	return r.tunnels[id]
 }
 
+func (r *InMemoryRegistry) Range(f func(id string, tunnel *Multiplexer) bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for id, t := range r.tunnels {
+		if !f(id, t) {
+			break
+		}
+	}
+}
+
 type Server struct {
-	config   *Config
+	config   *ServerConfig
 	auth     Authenticator
 	registry TunnelRegistry
 	wg       sync.WaitGroup
+	logger   *Logger
 }
 
 func main() {
-	configPath := flag.String("config", defaultConfigPath, "Path to config file")
+	configPath := flag.String("config", "server.json", "Path to config file")
 	flag.Parse()
 
-	cfg, err := loadConfig(*configPath)
+	logger := NewLogger("SERVER")
+
+	cfg, err := LoadServerConfig(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		logger.Fatal("Failed to load config: %v", err)
 	}
 
-	server := NewServer(cfg)
-	ctx, cancel := context.WithCancel(context.Background())
+	logger.Info("Config loaded and validated successfully")
 
+	server := NewServer(cfg, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
-		log.Println("Shutting down...")
+		logger.Info("Shutting down...")
 		cancel()
 	}()
 
 	if err := server.Run(ctx); err != nil {
-		log.Fatalf("Server error: %v", err)
+		logger.Fatal("Server error: %v", err)
 	}
-
-	log.Println("Shutdown complete")
+	logger.Info("Shutdown complete")
 }
 
-func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
-}
 
-func NewServer(cfg *Config) *Server {
+
+func NewServer(cfg *ServerConfig, logger *Logger) *Server {
 	return &Server{
 		config:   cfg,
-		auth:     NewInMemoryAuthenticator(cfg.Users),
+		auth:     NewInMemoryAuthenticator(cfg.Clients),
 		registry: NewInMemoryRegistry(),
+		logger:   logger,
 	}
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	log.Printf("Starting Bleep Proxy Server")
-	
-	s.wg.Add(1)
-	go s.runStatsServer(ctx)
+	s.logger.Info("Bleep Proxy Server v%s", Version)
+
+	if s.config.API != "" {
+		s.wg.Add(1)
+		go s.runStatsServer(ctx)
+	}
 
 	s.wg.Add(1)
 	go s.runClientListener(ctx)
 
 	for _, lCfg := range s.config.Listeners {
-		l, err := NewListenerFactory(lCfg, s.registry)
+		l, err := NewListenerFactory(lCfg, s.registry, s.logger)
 		if err != nil {
-			log.Printf("Failed to create listener for %s:%d: %v", lCfg.Protocol, lCfg.Port, err)
+			s.logger.Error("Failed to create listener for %s:%d: %v", lCfg.Protocol, lCfg.Port, err)
 			continue
 		}
 		s.wg.Add(1)
@@ -216,40 +177,53 @@ func (s *Server) runStatsServer(ctx context.Context) {
 	defer s.wg.Done()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/statistics", func(w http.ResponseWriter, r *http.Request) {
-		stats := make(map[string]interface{})
-		tunnels := make([]map[string]interface{}, 0)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "healthy",
+			"version": Version,
+		})
+	})
 
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		type ClientStats struct {
+			ID       string `json:"id"`
+			Sent     string `json:"sent"`
+			Recv     string `json:"recv"`
+			Channels int    `json:"channels"`
+		}
+
+		type StatsResponse struct {
+			Clients   []ClientStats    `json:"clients"`
+			Listeners []ListenerConfig `json:"listeners"`
+		}
+
+		clients := make([]ClientStats, 0)
 		s.registry.Range(func(id string, t *Multiplexer) bool {
-			tunnelStats := map[string]interface{}{
-				"client_id":      id,
-				"bytes_sent":     atomic.LoadUint64(&t.BytesSent),
-				"bytes_received": atomic.LoadUint64(&t.BytesReceived),
-
-			}
-			tunnels = append(tunnels, tunnelStats)
+			sent, recv, channels := t.GetStats()
+			clients = append(clients, ClientStats{
+				ID:       id,
+				Sent:     FormatBytes(sent),
+				Recv:     FormatBytes(recv),
+				Channels: channels,
+			})
 			return true
 		})
 
-		stats["tunnels_count"] = len(tunnels)
-		stats["tunnels"] = tunnels
-		stats["listeners"] = s.config.Listeners
-
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(stats)
+		json.NewEncoder(w).Encode(StatsResponse{
+			Clients:   clients,
+			Listeners: s.config.Listeners,
+		})
 	})
 
-	port := s.config.StatsPort
-	if port == "" {
-		port = "8080"
-	}
-
 	server := &http.Server{
-		Addr:    ":" + port,
+		Addr:    ":" + s.config.API,
 		Handler: mux,
 	}
 
-	log.Printf("Starting Stats Server on :%s", port)
+	s.logger.Info("API Server on :%s", s.config.API)
 
 	go func() {
 		<-ctx.Done()
@@ -257,22 +231,21 @@ func (s *Server) runStatsServer(ctx context.Context) {
 	}()
 
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
-		log.Printf("Stats server error: %v", err)
+		s.logger.Error("Stats server error: %v", err)
 	}
 }
 
 func (s *Server) runClientListener(ctx context.Context) {
 	defer s.wg.Done()
-	
-	addr := ":" + s.config.ClientListenPort
+
+	addr := ":" + s.config.Port
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Printf("Failed to listen for clients on %s: %v", addr, err)
-		return
+		s.logger.Fatal("Failed to listen for clients on %s: %v", addr, err)
 	}
 	defer listener.Close()
 
-	log.Printf("Listening for clients on %s", addr)
+	s.logger.Info("Listening for clients on %s", addr)
 
 	go func() {
 		<-ctx.Done()
@@ -286,7 +259,7 @@ func (s *Server) runClientListener(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				log.Printf("Accept client error: %v", err)
+				s.logger.Error("Accept client error: %v", err)
 				continue
 			}
 		}
@@ -295,58 +268,56 @@ func (s *Server) runClientListener(ctx context.Context) {
 }
 
 func (s *Server) handleClientConnection(conn net.Conn) {
-    defer func() {
-        if r := recover(); r != nil {
-            log.Printf("Recovered from panic in client session: %v", r)
-        }
-    }()
-    
-    id, key, err := s.handshake(conn)
-    if err != nil {
-        log.Printf("Handshake failed: %v", err)
-        conn.Close()
-        return
-    }
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("Panic in client session: %v", r)
+		}
+	}()
 
-    if !s.auth.Authenticate(id, key) {
-        log.Printf("Authentication failed for %s", id)
-        conn.Write([]byte{0}) 
-        conn.Close()
-        return
-    }
+	id, key, err := s.handshake(conn)
+	if err != nil {
+		s.logger.Error("Handshake failed: %v", err)
+		conn.Close()
+		return
+	}
 
-    if _, err := conn.Write([]byte{1}); err != nil {
-        log.Printf("Failed to send auth success to %s: %v", id, err)
-        conn.Close()
-        return
-    }
+	if !s.auth.Authenticate(id, key) {
+		s.logger.Warn("Authentication failed for %s", id)
+		conn.Write([]byte{0})
+		conn.Close()
+		return
+	}
 
-    log.Printf("Client connected: %s", id)
-    
-    mux := NewMultiplexer(conn)
-    s.registry.Register(id, mux)
+	if _, err := conn.Write([]byte{1}); err != nil {
+		s.logger.Error("Failed to send auth success to %s: %v", id, err)
+		conn.Close()
+		return
+	}
 
-    defer func() {
-        s.registry.Unregister(id)
-        mux.Close() 
-        log.Printf("Client disconnected and cleaned up: %s", id)
-    }()
+	s.logger.Info("Client connected: %s", id)
 
-    mux.ReadLoop(func(frame *Frame) {
-        if frame.Type == FrameTypeClose {
-            mux.CloseChannel(frame.ChannelID)
-            log.Printf("Channel %d closed by client %s", frame.ChannelID, id)
-        }
-    })
+	mux := NewMultiplexer(conn)
+	s.registry.Register(id, mux)
+
+	defer func() {
+		s.registry.Unregister(id)
+		mux.Close()
+		s.logger.Info("Client disconnected: %s", id)
+	}()
+
+	mux.ReadLoop(func(frame *Frame) {
+		if frame.Type == FrameTypeClose {
+			mux.CloseChannel(frame.ChannelID)
+		}
+	})
 }
 
 func (s *Server) handshake(conn net.Conn) (string, string, error) {
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(keepAlivePeriod)
+	if err := ConfigureTCPConn(conn); err != nil {
+		s.logger.Warn("Failed to configure TCP: %v", err)
 	}
 
-	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	conn.SetReadDeadline(time.Now().Add(HandshakeTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 
 	reader := bufio.NewReader(conn)
@@ -363,21 +334,23 @@ func (s *Server) handshake(conn net.Conn) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
-func NewListenerFactory(cfg ListenerConfig, registry TunnelRegistry) (Listener, error) {
+func NewListenerFactory(cfg ListenerConfig, registry TunnelRegistry, logger *Logger) (Listener, error) {
 	switch cfg.Protocol {
 	case "tcp":
 		return &TCPListener{
 			port:     cfg.Port,
-			target:   cfg.TargetClient,
+			target:   cfg.Client,
 			priority: cfg.Priority,
 			registry: registry,
+			logger:   logger,
 		}, nil
 	case "udp":
 		return &UDPListener{
 			port:     cfg.Port,
-			target:   cfg.TargetClient,
+			target:   cfg.Client,
 			priority: cfg.Priority,
 			registry: registry,
+			logger:   logger,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", cfg.Protocol)
@@ -389,17 +362,18 @@ type TCPListener struct {
 	target   string
 	priority int
 	registry TunnelRegistry
+	logger   *Logger
 }
 
 func (l *TCPListener) Start(ctx context.Context) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", l.port))
 	if err != nil {
-		log.Printf("TCP Listener error on %d: %v", l.port, err)
+		l.logger.Error("TCP Listener error on %d: %v", l.port, err)
 		return
 	}
 	defer listener.Close()
 
-	log.Printf("Started TCP Listener on :%d -> %s", l.port, l.target)
+	l.logger.Info("TCP Listener on :%d -> %s", l.port, l.target)
 
 	go func() {
 		<-ctx.Done()
@@ -413,10 +387,11 @@ func (l *TCPListener) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				log.Printf("Accept error on :%d: %v", l.port, err)
+				l.logger.Error("Accept error on :%d: %v", l.port, err)
 				continue
 			}
 		}
+		l.logger.Info("New TCP connection on :%d from %s", l.port, conn.RemoteAddr())
 		go l.handleConn(conn)
 	}
 }
@@ -424,25 +399,32 @@ func (l *TCPListener) Start(ctx context.Context) {
 func (l *TCPListener) handleConn(conn net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[TCP] Recovered from panic in handleConn: %v", r)
+			l.logger.Error("Panic in TCP handleConn: %v", r)
 		}
 		conn.Close()
 	}()
 
 	tunnel := l.registry.Get(l.target)
 	if tunnel == nil {
-		log.Printf("Target client %s not connected, dropping TCP connection on :%d", l.target, l.port)
+		l.logger.Warn("Client %s not connected, dropping TCP connection on :%d", l.target, l.port)
 		return
 	}
 
 	chID, stream := tunnel.OpenChannel(l.priority)
-	log.Printf("[CH %d] New TCP connection on :%d -> %s", chID, l.port, l.target)
+	l.logger.Info("Opening tunnel: TCP :%d -> %s (CH %d)", l.port, l.target, chID)
 
 	payload := []byte{byte(ProtocolTCP), byte(l.priority)}
-	if err := tunnel.WriteFrame(&Frame{Type: FrameTypeOpen, ChannelID: chID, Data: payload}); err != nil {
+	if err := tunnel.WriteFrame(&Frame{
+		Type:      FrameTypeOpen,
+		ChannelID: chID,
+		Data:      payload,
+	}); err != nil {
+		l.logger.Error("Failed to send OPEN frame for CH %d: %v", chID, err)
 		tunnel.CloseChannel(chID)
 		return
 	}
+
+	l.logger.Debug("OPEN frame sent for CH %d", chID)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -450,29 +432,46 @@ func (l *TCPListener) handleConn(conn net.Conn) {
 	go func() {
 		defer wg.Done()
 		l.pipeSocketToTunnel(conn, tunnel, chID)
+		l.logger.Debug("Socket->Tunnel pipe closed for CH %d", chID)
 	}()
 
 	go func() {
 		defer wg.Done()
 		l.pipeTunnelToSocket(stream, conn)
+		l.logger.Debug("Tunnel->Socket pipe closed for CH %d", chID)
 	}()
 
 	wg.Wait()
 	tunnel.CloseChannel(chID)
+	l.logger.Info("Tunnel closed: CH %d", chID)
 }
 
 func (l *TCPListener) pipeSocketToTunnel(conn net.Conn, tunnel *Multiplexer, chID uint32) {
-	buf := make([]byte, readBufferSize)
+	buf := make([]byte, ReadBufferSize)
+	totalBytes := uint64(0)
+	packetCount := 0
+	
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
+			packetCount++
+			totalBytes += uint64(n)
+			
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			if err := tunnel.WriteFrame(&Frame{Type: FrameTypeData, ChannelID: chID, Data: data}); err != nil {
+			
+			if err := tunnel.WriteFrame(&Frame{
+				Type:      FrameTypeData,
+				ChannelID: chID,
+				Data:      data,
+			}); err != nil {
+				l.logger.Error("CH %d: Write failed: %v", chID, err)
 				return
 			}
 		}
+		
 		if err != nil {
+			l.logger.Info("CH %d: Closed after %d packets, %d bytes", chID, packetCount, totalBytes)
 			tunnel.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: chID})
 			return
 		}
@@ -485,6 +484,7 @@ func (l *TCPListener) pipeTunnelToSocket(stream chan *Frame, conn net.Conn) {
 			return
 		}
 		if _, err := conn.Write(frame.Data); err != nil {
+			l.logger.Error("CH %d: Write failed: %v", frame.ChannelID, err)
 			return
 		}
 	}
@@ -495,27 +495,28 @@ type UDPListener struct {
 	target   string
 	priority int
 	registry TunnelRegistry
+	logger   *Logger
 }
 
 func (l *UDPListener) Start(ctx context.Context) {
 	conn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", l.port))
 	if err != nil {
-		log.Printf("UDP Listener error on %d: %v", l.port, err)
+		l.logger.Error("UDP Listener error on %d: %v", l.port, err)
 		return
 	}
 	defer conn.Close()
 
-	log.Printf("Started UDP Listener on :%d -> %s", l.port, l.target)
+	l.logger.Info("UDP Listener on :%d -> %s", l.port, l.target)
 
 	go func() {
 		<-ctx.Done()
 		conn.Close()
 	}()
 
-	sessions := NewUDPSessionManager(l.registry, l.target, l.priority, conn)
+	sessions := NewUDPSessionManager(l.registry, l.target, l.priority, conn, l.logger)
 	go sessions.CleanupLoop(ctx)
 
-	buf := make([]byte, udpBufferSize)
+	buf := make([]byte, UDPBufferSize)
 	for {
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
@@ -523,11 +524,11 @@ func (l *UDPListener) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				log.Printf("Read error on :%d: %v", l.port, err)
+				l.logger.Error("Read error on :%d: %v", l.port, err)
 				continue
 			}
 		}
-		
+
 		data := make([]byte, n)
 		copy(data, buf[:n])
 		sessions.HandlePacket(addr, data)
@@ -535,12 +536,13 @@ func (l *UDPListener) Start(ctx context.Context) {
 }
 
 type UDPSessionManager struct {
-	registry     TunnelRegistry
-	target       string
-	priority     int
-	conn         net.PacketConn
-	sessions     map[string]*UDPSession
-	mu           sync.Mutex
+	registry TunnelRegistry
+	target   string
+	priority int
+	conn     net.PacketConn
+	sessions map[string]*UDPSession
+	mu       sync.Mutex
+	logger   *Logger
 }
 
 type UDPSession struct {
@@ -548,19 +550,21 @@ type UDPSession struct {
 	lastActive time.Time
 }
 
-func NewUDPSessionManager(reg TunnelRegistry, target string, priority int, conn net.PacketConn) *UDPSessionManager {
+func NewUDPSessionManager(reg TunnelRegistry, target string, priority int, conn net.PacketConn, logger *Logger) *UDPSessionManager {
 	return &UDPSessionManager{
 		registry: reg,
 		target:   target,
 		priority: priority,
 		conn:     conn,
 		sessions: make(map[string]*UDPSession),
+		logger:   logger,
 	}
 }
 
 func (m *UDPSessionManager) CleanupLoop(ctx context.Context) {
-	ticker := time.NewTicker(cleanupInterval)
+	ticker := time.NewTicker(CleanupInterval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -574,14 +578,16 @@ func (m *UDPSessionManager) CleanupLoop(ctx context.Context) {
 func (m *UDPSessionManager) prune() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	now := time.Now()
 	for key, s := range m.sessions {
-		if now.Sub(s.lastActive) > sessionTimeout {
+		if now.Sub(s.lastActive) > SessionTimeout {
 			if t := m.registry.Get(m.target); t != nil {
 				t.CloseChannel(s.chID)
 				t.WriteFrame(&Frame{Type: FrameTypeClose, ChannelID: s.chID})
 			}
 			delete(m.sessions, key)
+			m.logger.Debug("UDP session %s pruned", key)
 		}
 	}
 }
@@ -589,7 +595,7 @@ func (m *UDPSessionManager) prune() {
 func (m *UDPSessionManager) HandlePacket(addr net.Addr, data []byte) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[UDP] Recovered from panic in HandlePacket: %v", r)
+			m.logger.Error("Panic in UDP HandlePacket: %v", r)
 		}
 	}()
 
@@ -599,6 +605,7 @@ func (m *UDPSessionManager) HandlePacket(addr net.Addr, data []byte) {
 	}
 
 	key := addr.String()
+
 	m.mu.Lock()
 	sess, exists := m.sessions[key]
 	if exists {
@@ -613,20 +620,32 @@ func (m *UDPSessionManager) HandlePacket(addr net.Addr, data []byte) {
 		}
 	}
 
-	tunnel.WriteFrame(&Frame{Type: FrameTypeData, ChannelID: sess.chID, Data: data})
+	tunnel.WriteFrame(&Frame{
+		Type:      FrameTypeData,
+		ChannelID: sess.chID,
+		Data:      data,
+	})
 }
 
 func (m *UDPSessionManager) createSession(key string, addr net.Addr, tunnel *Multiplexer) *UDPSession {
 	chID, stream := tunnel.OpenChannel(m.priority)
-	log.Printf("[CH %d] New UDP session %s -> %s", chID, key, m.target)
+	m.logger.Debug("New UDP session %s -> %s (CH %d)", key, m.target, chID)
 
 	payload := []byte{byte(ProtocolUDP), byte(m.priority)}
-	if err := tunnel.WriteFrame(&Frame{Type: FrameTypeOpen, ChannelID: chID, Data: payload}); err != nil {
+	if err := tunnel.WriteFrame(&Frame{
+		Type:      FrameTypeOpen,
+		ChannelID: chID,
+		Data:      payload,
+	}); err != nil {
 		tunnel.CloseChannel(chID)
 		return nil
 	}
 
-	sess := &UDPSession{chID: chID, lastActive: time.Now()}
+	sess := &UDPSession{
+		chID:       chID,
+		lastActive: time.Now(),
+	}
+
 	m.mu.Lock()
 	m.sessions[key] = sess
 	m.mu.Unlock()
@@ -639,11 +658,13 @@ func (m *UDPSessionManager) createSession(key string, addr net.Addr, tunnel *Mul
 				break
 			}
 		}
+
 		m.mu.Lock()
 		if s, ok := m.sessions[key]; ok && s.chID == chID {
 			delete(m.sessions, key)
 		}
 		m.mu.Unlock()
+
 		tunnel.CloseChannel(chID)
 	}()
 
